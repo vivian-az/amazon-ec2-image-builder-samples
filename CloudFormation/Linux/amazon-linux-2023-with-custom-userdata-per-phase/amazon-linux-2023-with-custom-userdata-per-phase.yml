@@ -1,0 +1,526 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EC2 Image Builder with default build workflow (build user data in recipe)
+  and a custom test workflow that uses WaitForAction + Lambda to launch the
+  test instance with different user data.
+
+Parameters:
+  SubnetId:
+    Type: String
+    Default: ''
+    Description: (Optional) Subnet for the build/test instances. If empty, Image Builder uses default VPC.
+
+  SecurityGroupId:
+    Type: String
+    Default: ''
+    Description: (Optional) Security group for the build/test instances. If empty, Image Builder uses default VPC SG.
+
+  InstanceType:
+    Type: String
+    Default: m5.large
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+
+  BuildUserData:
+    Type: String
+    Default: |
+      #!/bin/bash
+      mkdir -p /tmp/hello-test
+      echo "hello build" > /tmp/hello-test/speak.txt
+    Description: User data script for the BUILD phase (set in recipe)
+
+  TestUserData:
+    Type: String
+    Default: |
+      #!/bin/bash
+      mkdir -p /tmp/hello-test
+      echo "hello test" > /tmp/hello-test/speak.txt
+    Description: User data script for the TEST phase (passed by Lambda)
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID (resolved from SSM Parameter Store)
+
+Conditions:
+  HasSubnet: !Not [!Equals [!Ref SubnetId, '']]
+  HasSecurityGroup: !Not [!Equals [!Ref SecurityGroupId, '']]
+
+Resources:
+  # ============================================================
+  # EC2 Instance Role
+  # ============================================================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ============================================================
+  # Lambda Execution Role (test phase only)
+  # ============================================================
+  TestLaunchLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TestLaunchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - imagebuilder:GetImage
+                  - imagebuilder:SendWorkflowStepAction
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:RunInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EC2InstanceRole.Arn
+              - Effect: Allow
+                Action: ssm:DescribeInstanceInformation
+                Resource: '*'
+
+  TestLaunchLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-TestLaunchFn
+      RetentionInDays: 30
+
+  # ============================================================
+  # Lambda — launches TEST instance with custom user data
+  # ============================================================
+  TestLaunchLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TestLaunchLambdaLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-TestLaunchFn
+      Handler: index.handler
+      Role: !GetAtt TestLaunchLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      Environment:
+        Variables:
+          TEST_USER_DATA: !Ref TestUserData
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import base64
+          import time
+
+          ec2 = boto3.client('ec2')
+          ib = boto3.client('imagebuilder')
+          ssm = boto3.client('ssm')
+
+          def handler(event, context):
+              """
+              Invoked by Image Builder WaitForAction step in the test workflow.
+              Launches a test instance using the built AMI with custom test user data.
+              All infra config is fetched from GetImage.
+              """
+              print(json.dumps(event))
+
+              image_arn = event['imageArn']
+              step_execution_id = event['workflowStepExecutionId']
+
+              try:
+                  # Fetch image details
+                  image = ib.get_image(imageBuildVersionArn=image_arn)['image']
+                  infra = image.get('infrastructureConfiguration', {})
+
+                  # Get the AMI built in the build phase
+                  amis = image.get('outputResources', {}).get('amis', [])
+                  if not amis or not amis[0].get('image'):
+                      raise Exception('No output AMI found. Build may not have completed.')
+                  ami_id = amis[0]['image']
+
+                  # Encode test user data
+                  user_data_b64 = base64.b64encode(
+                      os.environ['TEST_USER_DATA'].encode('utf-8')
+                  ).decode('utf-8')
+
+                  # Build RunInstances params from infra config
+                  run_params = {
+                      'ImageId': ami_id,
+                      'MinCount': 1,
+                      'MaxCount': 1,
+                      'InstanceType': infra.get('instanceTypes', ['m5.large'])[0],
+                      'UserData': user_data_b64,
+                      'TagSpecifications': [{
+                          'ResourceType': 'instance',
+                          'Tags': [
+                              {'Key': 'Name', 'Value': f'ImageBuilder-test-{image_arn.split("/")[1]}'},
+                              {'Key': 'CreatedBy', 'Value': 'EC2 Image Builder'},
+                              {'Key': 'Ec2ImageBuilderArn', 'Value': image_arn},
+                          ]
+                      }]
+                  }
+
+                  if infra.get('subnetId'):
+                      run_params['SubnetId'] = infra['subnetId']
+                  if infra.get('securityGroupIds'):
+                      run_params['SecurityGroupIds'] = infra['securityGroupIds']
+                  if infra.get('instanceProfileName'):
+                      run_params['IamInstanceProfile'] = {'Name': infra['instanceProfileName']}
+                  if infra.get('keyPair'):
+                      run_params['KeyName'] = infra['keyPair']
+
+                  placement = infra.get('placement')
+                  if placement:
+                      run_params['Placement'] = {}
+                      if placement.get('tenancy'):
+                          run_params['Placement']['Tenancy'] = placement['tenancy']
+                      if placement.get('hostId'):
+                          run_params['Placement']['HostId'] = placement['hostId']
+                      if placement.get('availabilityZone'):
+                          run_params['Placement']['AvailabilityZone'] = placement['availabilityZone']
+
+                  metadata = infra.get('instanceMetadataOptions')
+                  if metadata:
+                      run_params['MetadataOptions'] = {}
+                      if metadata.get('httpTokens'):
+                          run_params['MetadataOptions']['HttpTokens'] = metadata['httpTokens']
+                      if metadata.get('httpPutResponseHopLimit'):
+                          run_params['MetadataOptions']['HttpPutResponseHopLimit'] = metadata['httpPutResponseHopLimit']
+
+                  # Launch
+                  run_result = ec2.run_instances(**run_params)
+                  instance_id = run_result['Instances'][0]['InstanceId']
+                  print(f'Launched test instance: {instance_id} from AMI: {ami_id}')
+
+                  # Wait for running
+                  waiter = ec2.get_waiter('instance_running')
+                  waiter.wait(InstanceIds=[instance_id], WaiterConfig={'Delay': 15, 'MaxAttempts': 40})
+
+                  # Wait for SSM agent
+                  for attempt in range(40):
+                      resp = ssm.describe_instance_information(
+                          Filters=[{'Key': 'InstanceIds', 'Values': [instance_id]}]
+                      )
+                      info_list = resp.get('InstanceInformationList', [])
+                      if info_list and info_list[0].get('PingStatus') == 'Online':
+                          print(f'SSM agent online for {instance_id}')
+                          break
+                      time.sleep(15)
+                  else:
+                      raise Exception(f'SSM agent did not come online for {instance_id}')
+
+                  # Resume workflow
+                  ib.send_workflow_step_action(
+                      stepExecutionId=step_execution_id,
+                      imageBuildVersionArn=image_arn,
+                      action='RESUME',
+                      reason=instance_id,
+                  )
+                  return {'statusCode': 200, 'body': f'Test instance {instance_id} launched'}
+
+              except Exception as e:
+                  print(f'Error: {e}')
+                  try:
+                      ib.send_workflow_step_action(
+                          stepExecutionId=step_execution_id,
+                          imageBuildVersionArn=image_arn,
+                          action='STOP',
+                          reason=f'Lambda error: {str(e)[:200]}',
+                      )
+                  except Exception as stop_err:
+                      print(f'Failed to send STOP: {stop_err}')
+                  raise
+
+  # ============================================================
+  # Image Builder Execution Role
+  # ============================================================
+  ImageBuilderExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/EC2ImageBuilderLifecycleExecutionPolicy
+      Policies:
+        - PolicyName: ImageBuilderExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:RegisterImage
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:*::image/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/CreatedBy: EC2 Image Builder
+              - Effect: Allow
+                Action: ec2:RegisterImage
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:*::snapshot/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/CreatedBy: EC2 Image Builder
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:*::image/*
+                  - !Sub arn:${AWS::Partition}:ec2:*::snapshot/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:subnet/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:network-interface/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:security-group/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:key-pair/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:launch-template/*
+              - Effect: Allow
+                Action: ec2:RunInstances
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:volume/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:instance/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/CreatedBy:
+                      - EC2 Image Builder
+                      - EC2 Fast Launch
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EC2InstanceRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:TerminateInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/CreatedBy: EC2 Image Builder
+              - Effect: Allow
+                Action:
+                  - ec2:CreateImage
+                  - ec2:DeregisterImage
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstanceAttribute
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeTags
+                  - ec2:DescribeSnapshots
+                Resource: '*'
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:CreateAction:
+                      - RunInstances
+                      - CreateImage
+                    aws:RequestTag/CreatedBy:
+                      - EC2 Image Builder
+                      - EC2 Fast Launch
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:*::image/*
+              - Effect: Allow
+                Action: ec2:ModifySnapshotAttribute
+                Resource: !Sub arn:${AWS::Partition}:ec2:*::snapshot/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/CreatedBy: EC2 Image Builder
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt TestLaunchLambdaFunction.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:ListCommands
+                  - ssm:ListCommandInvocations
+                  - ssm:ListInventoryEntries
+                  - ssm:AddTagsToResource
+                  - ssm:DescribeInstanceInformation
+                  - ssm:DescribeInstanceAssociationsStatus
+                  - ssm:DescribeAssociationExecutions
+                  - ssm:GetAutomationExecution
+                  - ssm:StopAutomationExecution
+                  - ssm:SendAutomationSignal
+                  - ssm:GetCommandInvocation
+                  - ssm:GetDocument
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: '*'
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:*:*:document/AWS-RunPowerShellScript
+                  - !Sub arn:${AWS::Partition}:ssm:*:*:document/AWS-RunShellScript
+                  - !Sub arn:${AWS::Partition}:ssm:*:*:document/AWSEC2-RunSysprep
+                  - !Sub arn:${AWS::Partition}:s3:::*
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:instance/*
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/CreatedBy: EC2 Image Builder
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: !Sub arn:${AWS::Partition}:ssm:*:*:automation-definition/ImageBuilder*
+              - Effect: Allow
+                Action:
+                  - ssm:CreateAssociation
+                  - ssm:DeleteAssociation
+                  - ssm:DescribeAssociationExecutions
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:*:*:document/AWS-GatherSoftwareInventory
+                  - !Sub arn:${AWS::Partition}:ssm:*:*:association/*
+                  - !Sub arn:${AWS::Partition}:ec2:*:*:instance/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:*:*:log-group:/aws/imagebuilder/*
+
+  # ============================================================
+  # Infrastructure Configuration
+  # ============================================================
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub ${AWS::StackName}-InfraConfig
+      InstanceProfileName: !Ref EC2InstanceProfile
+      InstanceTypes:
+        - !Ref InstanceType
+      SecurityGroupIds: !If
+        - HasSecurityGroup
+        - [!Ref SecurityGroupId]
+        - !Ref AWS::NoValue
+      SubnetId: !If
+        - HasSubnet
+        - !Ref SubnetId
+        - !Ref AWS::NoValue
+      TerminateInstanceOnFailure: true
+      InstanceMetadataOptions:
+        HttpPutResponseHopLimit: 2
+        HttpTokens: required
+
+  # ============================================================
+  # Recipe — build user data in recipe, used by default build workflow
+  # ============================================================
+  ImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub ${AWS::StackName}-Recipe
+      Version: '1.3.x'
+      ParentImage: !Ref LatestAmiId
+      Components:
+        - ComponentArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:component/hello-world-linux/x.x.x
+        - ComponentArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:component/user-data-lambda-validate-userdata/1.0.0/1
+      AdditionalInstanceConfiguration:
+        UserDataOverride:
+          Fn::Base64: !Ref BuildUserData
+
+  # ============================================================
+  # Distribution Configuration
+  # ============================================================
+  DistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub ${AWS::StackName}-DistConfig
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: !Sub '${AWS::StackName}-{{imagebuilder:buildDate}}'
+
+  # ============================================================
+  # Custom TEST Workflow only — build uses default
+  # ============================================================
+  TestWorkflow:
+    Type: AWS::ImageBuilder::Workflow
+    Properties:
+      Name: !Sub ${AWS::StackName}-TestWorkflow
+      Description: Test workflow that launches instance via Lambda with test-specific user data
+      Type: TEST
+      Version: 1.0.0
+      Data: !Sub |
+        name: custom-launch-test
+        description: Test workflow using WaitForAction to launch instance with test-specific user data
+        schemaVersion: 1.0
+
+        steps:
+          - name: LaunchTestInstance
+            action: WaitForAction
+            onFailure: Abort
+            inputs:
+              lambdaFunctionName: ${AWS::StackName}-TestLaunchFn
+
+          - name: ApplyTestComponents
+            action: ExecuteComponents
+            onFailure: Abort
+            inputs:
+              instanceId.$: "$.stepOutputs.LaunchTestInstance.reason"
+
+          - name: TerminateTestInstance
+            action: TerminateInstance
+            onFailure: Continue
+            inputs:
+              instanceId.$: "$.stepOutputs.LaunchTestInstance.reason"
+
+  # ============================================================
+  # Pipeline — default build workflow + custom test workflow
+  # ============================================================
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-Pipeline
+      InfrastructureConfigurationArn: !GetAtt InfrastructureConfiguration.Arn
+      DistributionConfigurationArn: !GetAtt DistributionConfiguration.Arn
+      ImageRecipeArn: !GetAtt ImageRecipe.Arn
+      ExecutionRole: !GetAtt ImageBuilderExecutionRole.Arn
+      Workflows:
+        - WorkflowArn: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:workflow/build/build-image/x.x.x
+        - WorkflowArn: !GetAtt TestWorkflow.Arn
+
+Outputs:
+  PipelineArn:
+    Value: !GetAtt ImagePipeline.Arn
+  TestLaunchLambdaArn:
+    Value: !GetAtt TestLaunchLambdaFunction.Arn
